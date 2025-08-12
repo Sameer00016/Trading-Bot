@@ -1,0 +1,11 @@
+streamlit
+python-telegram-bot==13.15
+pandas
+numpy
+requests
+beautifulsoup4
+scikit-learn
+matplotlib
+plotly
+ipywidgets
+python-dotenv
