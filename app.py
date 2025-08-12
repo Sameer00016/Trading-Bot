@@ -44,3 +44,11 @@ if st.button("Get Signal"):
     msg = f"📊 Signal for {signal['symbol']}\nTrend: {signal['signal']}\nPrice: {signal['current_price']}\nTarget Time: {signal['target_time']}\nExit Price: {signal['exit_price']}"
     requests.get(f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={CHAT_ID}&text={msg}")
     st.success("Signal sent to Telegram ✅")
+from bot_core import send_telegram_message, generate_trade_signal
+
+st.title("📊 Trading Bot Dashboard")
+
+if st.button("📤 Send Test Signal"):
+    signal = generate_trade_signal()
+    send_telegram_message(signal)
+    st.success("✅ Signal sent to your Telegram!")
