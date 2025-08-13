@@ -9,3 +9,5 @@ matplotlib
 plotly
 ipywidgets
 python-dotenv
+ta
+ccxt
