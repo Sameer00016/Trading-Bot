@@ -81,22 +81,10 @@ class ExchangeManager:
             return self.exchange.fetch_order_book(symbol, limit=limit)
 
 # ========== MARKET ANALYSIS ==========
-def fetch_historical_data(exchange_mgr, symbol, timeframe="5m", limit=200):
-    return exchange_mgr.fetch_ohlcv(symbol, timeframe, limit)
-
-def get_orderbook_imbalance(exchange_mgr, symbol):
-    ob = exchange_mgr.fetch_orderbook(symbol)
-    bids = sum([b[1] for b in ob["bids"]])
-    asks = sum([a[1] for a in ob["asks"]])
-    return (bids - asks) / (bids + asks) if (bids + asks) > 0 else 0
-
 def analyze_market(df):
-    close = df["close"].values
     df["rsi"] = ta.rsi(df['close'], length=14)
-macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
-macd = macd_df['MACD_12_26_9']
-signal = macd_df['MACDs_12_26_9']
-hist = macd_df['MACDh_12_26_9']
+    macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
+    df["macd"] = macd_df['MACD_12_26_9']
     df["ema"] = ta.ema(df['close'], length=50)
     df["atr"] = ta.atr(df['high'], df['low'], df['close'], length=14)
     return df
@@ -173,24 +161,11 @@ def scan_pairs(exchange_mgr, base="USDT", limit=10):
     ranked.sort(key=lambda x: x[1], reverse=True)
     return [p[0] for p in ranked[:limit]]
 
-# ========== BACKTESTING ==========
-def run_backtest(df):
-    df = analyze_market(df)
-    balance = 1000
-    for i in range(50, len(df)):
-        p_up = probability_model(df.iloc[:i], 0)
-        signal, atr = generate_signal(df.iloc[:i], p_up, 0)
-        if signal != "WAIT":
-            plan = make_trade_plan(signal, df["close"].iloc[i], atr, balance)
-            balance += (plan["tp"] - df["close"].iloc[i]) if signal == "BUY" else (df["close"].iloc[i] - plan["tp"])
-    return balance
-
 # ========== TELEGRAM ALERTS ==========
 def send_telegram_alert(token, chat_id, message, df=None):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     requests.post(url, data={"chat_id": chat_id, "text": message})
 
-    # Optional chart snapshot
     if df is not None:
         fig = go.Figure(data=[go.Candlestick(
             x=df["timestamp"],
@@ -201,4 +176,3 @@ def send_telegram_alert(token, chat_id, message, df=None):
         files = {"photo": BytesIO(img_bytes)}
         url = f"https://api.telegram.org/bot{token}/sendPhoto"
         requests.post(url, data={"chat_id": chat_id}, files=files)
-
