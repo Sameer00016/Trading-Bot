@@ -4,7 +4,7 @@ import functools
 import pandas as pd
 import numpy as np
 import ccxt
-import talib
+import pandas_ta as ta
 import logging
 import plotly.graph_objects as go
 from io import BytesIO
@@ -92,11 +92,13 @@ def get_orderbook_imbalance(exchange_mgr, symbol):
 
 def analyze_market(df):
     close = df["close"].values
-    df["rsi"] = talib.RSI(close, timeperiod=14)
-    macd, signal, hist = talib.MACD(close, 12, 26, 9)
-    df["macd"] = macd - signal
-    df["ema"] = talib.EMA(close, timeperiod=50)
-    df["atr"] = talib.ATR(df["high"], df["low"], close, timeperiod=14)
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
+    macd = macd_df['MACD_12_26_9']
+    signal = macd_df['MACDs_12_26_9']
+    hist = macd_df['MACDh_12_26_9']
+    df["ema"] = ta.ema(df['close'], length=50)
+    df["atr"] = ta.atr(df['high'], df['low'], df['close'], length=14)
     return df
 
 # ========== ADAPTIVE PROBABILITY MODEL ==========
