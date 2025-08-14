@@ -11,3 +11,4 @@ python-dotenv>=0.21.0
 ccxt>=3.0.0
 kaleido>=0.2.1
 pandas_ta>=0.3.14
+packaging>=21.0  # Required for version checks
