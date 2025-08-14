@@ -31,7 +31,7 @@ from bot_core import (
     format_signal_for_display, bitnodes_snapshot, send_telegram, fetch_htf_alignment,
     run_backtest
 )
-# [KEEP ALL YOUR ORIGINAL CODE AFTER IMPORTS]import subprocess
+import subprocess
 import sys
 import os
 
