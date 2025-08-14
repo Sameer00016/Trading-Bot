@@ -11,4 +11,4 @@ python-dotenv
 ta
 ccxt
 kaleido
-
+pandas_ta
