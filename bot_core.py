@@ -1,203 +1,262 @@
-import os
+# bot_core.py — pure pandas/numpy indicators + BB, multi-exchange, mock-safe
+
 import time
-import functools
-import pandas as pd
+from functools import wraps
+
 import numpy as np
-import ccxt
-import pandas_ta as ta
-import logging
-import plotly.graph_objects as go
-from io import BytesIO
+import pandas as pd
+
+# ccxt is optional: we fall back to mock mode if unavailable or init fails
+try:
+    import ccxt  # type: ignore
+    _CCXT_OK = True
+except Exception:
+    ccxt = None  # type: ignore
+    _CCXT_OK = False
+
 import requests
-from datetime import datetime, timedelta
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 
-# ========== LOGGER ==========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ========== BACKOFF RETRY DECORATOR ==========
-def backoff_retry(max_retries=5, backoff_factor=2):
-    """Retry a function with exponential backoff."""
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            delay = 1
+# =========================
+# Retry with exponential backoff
+# =========================
+def backoff_retry(max_retries=5, base_delay=1.0, max_delay=30.0):
+    def deco(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            delay = base_delay
             for attempt in range(max_retries):
                 try:
-                    return func(*args, **kwargs)
+                    return fn(*args, **kwargs)
                 except Exception as e:
-                    logging.warning(f"{func.__name__} failed: {e} (attempt {attempt+1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
-                        delay *= backoff_factor
-                    else:
+                    if attempt >= max_retries - 1:
                         raise
-        return wrapper
-    return decorator
+                    time.sleep(delay)
+                    delay = min(delay * 2, max_delay)
+            # Should never reach here
+            return fn(*args, **kwargs)
+        return wrapped
+    return deco
 
-# ========== EXCHANGE MANAGER ==========
+
+# =========================
+# Core technical indicators (pure pandas/numpy)
+# =========================
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    # Wilder's smoothing via EMA with alpha=1/length
+    avg_gain = gain.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50.0)
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    fast_ema = ema(series, fast)
+    slow_ema = ema(series, slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    close_prev = df["close"].shift(1)
+    tr1 = (df["high"] - df["low"]).abs()
+    tr2 = (df["high"] - close_prev).abs()
+    tr3 = (df["low"] - close_prev).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    # Wilder's ATR via EMA (alpha=1/length)
+    return tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+
+def bollinger_bands(series: pd.Series, length: int = 20, n_std: float = 2.0):
+    mid = series.rolling(length, min_periods=length).mean()
+    sd = series.rolling(length, min_periods=length).std(ddof=0)
+    upper = mid + n_std * sd
+    lower = mid - n_std * sd
+    width = (upper - lower) / mid.replace(0, np.nan)
+    # %B: where price sits within the bands
+    pb = (series - lower) / (upper - lower)
+    return mid, upper, lower, width, pb
+
+
+# =========================
+# Exchange Manager (mock-safe, multi-exchange)
+# =========================
 class ExchangeManager:
-    def __init__(self, exchange_name, api_key=None, api_secret=None, mock_mode=False):
-        self.mock_mode = mock_mode
-        if not mock_mode:
-            if exchange_name.lower() == "binance":
-                self.exchange = ccxt.binance({"apiKey": api_key, "secret": api_secret})
-            elif exchange_name.lower() == "mexc":
-                self.exchange = ccxt.mexc({"apiKey": api_key, "secret": api_secret})
-            else:
-                raise ValueError("Unsupported exchange")
-            self.exchange.load_markets()
-        else:
-            self.exchange = None
-            logging.info("Mock mode enabled — no real trades will be placed.")
+    def __init__(self, exchange_name: str, api_key: str | None = None, api_secret: str | None = None, mock_mode: bool = True):
+        """
+        If ccxt is unavailable or init fails, we silently fall back to mock_mode.
+        """
+        self.mock_mode = mock_mode or not _CCXT_OK
+        self.exchange = None
 
-    @backoff_retry()
-    def fetch_ohlcv(self, symbol, timeframe="5m", limit=200):
-        if self.mock_mode:
-            # Return fake OHLCV data
-            now = datetime.utcnow()
-            times = [now - timedelta(minutes=5*i) for i in range(limit)]
-            df = pd.DataFrame({
-                "timestamp": times[::-1],
-                "open": np.random.rand(limit) * 100,
-                "high": np.random.rand(limit) * 100,
-                "low": np.random.rand(limit) * 100,
-                "close": np.random.rand(limit) * 100,
-                "volume": np.random.rand(limit) * 1000
-            })
+        if not self.mock_mode:
+            try:
+                klass = getattr(ccxt, exchange_name.lower(), None)
+                if klass is None:
+                    raise ValueError(f"Unsupported exchange: {exchange_name}")
+                self.exchange = klass({"apiKey": api_key or "", "secret": api_secret or "", "enableRateLimit": True})
+                # Not all exchanges require this, but safe:
+                if hasattr(self.exchange, "load_markets"):
+                    self.exchange.load_markets()
+            except Exception:
+                # Fallback to mock if anything goes wrong
+                self.exchange = None
+                self.mock_mode = True
+
+    @backoff_retry(max_retries=4)
+    def get_ohlcv(self, symbol: str, timeframe: str = "1d", limit: int = 300) -> pd.DataFrame:
+        if self.mock_mode or self.exchange is None:
+            # Generate a smooth synthetic series with light trend + noise
+            idx = pd.date_range(end=pd.Timestamp.utcnow().floor("min"), periods=limit, freq=_tf_to_freq(timeframe))
+            base = np.cumsum(np.random.normal(0, 0.3, size=limit)) + 100
+            drift = np.linspace(0, np.random.uniform(-3, 3), limit)
+            close = base + drift
+            high = close + np.abs(np.random.normal(0.4, 0.2, size=limit))
+            low = close - np.abs(np.random.normal(0.4, 0.2, size=limit))
+            open_ = close + np.random.normal(0, 0.2, size=limit)
+            vol = np.abs(np.random.normal(10, 3, size=limit))
+            df = pd.DataFrame(
+                {"timestamp": idx, "open": open_, "high": high, "low": low, "close": close, "volume": vol}
+            )
             return df
         else:
             data = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_localize(None)
             return df
 
-    @backoff_retry()
-    def fetch_orderbook(self, symbol, limit=20):
-        if self.mock_mode:
-            return {"bids": [[100, 5], [99, 4]], "asks": [[101, 5], [102, 4]]}
-        else:
-            return self.exchange.fetch_order_book(symbol, limit=limit)
 
-# ========== MARKET ANALYSIS ==========
-def fetch_historical_data(exchange_mgr, symbol, timeframe="5m", limit=200):
-    return exchange_mgr.fetch_ohlcv(symbol, timeframe, limit)
+def _tf_to_freq(tf: str) -> str:
+    """Map ccxt timeframe to pandas frequency for mock series."""
+    mapping = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1H", "4h": "4H", "1d": "1D"}
+    return mapping.get(tf, "1D")
 
-def get_orderbook_imbalance(exchange_mgr, symbol):
-    ob = exchange_mgr.fetch_orderbook(symbol)
-    bids = sum([b[1] for b in ob["bids"]])
-    asks = sum([a[1] for a in ob["asks"]])
-    return (bids - asks) / (bids + asks) if (bids + asks) > 0 else 0
 
-def analyze_market(df):
-    close = df["close"].values
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    macd_df = ta.macd(df['close'], fast=12, slow=26, signal=9)
-    macd = macd_df['MACD_12_26_9']
-    signal = macd_df['MACDs_12_26_9']
-    hist = macd_df['MACDh_12_26_9']
-    df["ema"] = ta.ema(df['close'], length=50)
-    df["atr"] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    return df
+# =========================
+# Trading Strategy
+# =========================
+class TradingStrategy:
+    def __init__(self,
+                 ema_fast: int = 20,
+                 ema_slow: int = 50,
+                 rsi_len: int = 14,
+                 atr_len: int = 14,
+                 bb_len: int = 20,
+                 bb_n: float = 2.0):
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        self.rsi_len = rsi_len
+        self.atr_len = atr_len
+        self.bb_len = bb_len
+        self.bb_n = bb_n
 
-# ========== ADAPTIVE PROBABILITY MODEL ==========
-def probability_model(df, orderbook_imbalance):
-    # Feature prep
-    df = df.dropna()
-    if len(df) < 50:
-        # fallback to heuristic
-        roc = (df["close"].iloc[-1] - df["close"].iloc[-4]) / df["close"].iloc[-4]
-        trend = (df["ema"].iloc[-1] - df["ema"].iloc[-4]) / df["ema"].iloc[-4]
-        return 0.4 * roc + 0.3 * trend + 0.3 * orderbook_imbalance
+    def _ensure_sorted(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_values("timestamp")
+        return df
 
-    X = df[["rsi", "macd", "ema", "atr"]].values
-    y = np.where(df["close"].shift(-1) > df["close"], 1, 0)[:-1]
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Returns original df + indicator columns + 'signal' column in {BUY, SELL, HOLD}.
+        """
+        df = df.copy()
+        df = self._ensure_sorted(df)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X[:-1])
+        # Indicators
+        df["EMA_FAST"] = ema(df["close"], self.ema_fast)
+        df["EMA_SLOW"] = ema(df["close"], self.ema_slow)
+        df["RSI"] = rsi(df["close"], self.rsi_len)
+        macd_line, macd_sig, macd_hist = macd(df["close"])
+        df["MACD"] = macd_line
+        df["MACD_SIGNAL"] = macd_sig
+        df["MACD_HIST"] = macd_hist
+        df["ATR"] = atr(df, self.atr_len)
 
-    model = LogisticRegression()
-    model.fit(X_scaled, y)
-    latest_scaled = scaler.transform([X[-1]])
-    p_up = model.predict_proba(latest_scaled)[0][1]
-    return p_up
+        bb_mid, bb_up, bb_lo, bb_w, bb_pb = bollinger_bands(df["close"], self.bb_len, self.bb_n)
+        df["BB_MID"] = bb_mid
+        df["BB_UPPER"] = bb_up
+        df["BB_LOWER"] = bb_lo
+        df["BB_WIDTH"] = bb_w.fillna(0)
+        df["BB_PB"] = bb_pb.clip(0, 1).fillna(0.5)
 
-# ========== SIGNAL GENERATION ==========
-def generate_signal(df, p_up, orderbook_imbalance):
-    rsi = df["rsi"].iloc[-1]
-    macd = df["macd"].iloc[-1]
-    close = df["close"].iloc[-1]
-    ema = df["ema"].iloc[-1]
-    atr = df["atr"].iloc[-1]
+        # Default HOLD
+        df["signal"] = "HOLD"
 
-    if rsi < 40 and macd > 0 and close > ema and p_up > 0.55:
-        return "BUY", atr
-    elif rsi > 60 and macd < 0 and close < ema and p_up < 0.45:
-        return "SELL", atr
-    else:
-        return "WAIT", atr
+        # Signal logic (conservative & simple)
+        # BUY: bullish EMA stack, MACD momentum positive, price above BB mid, RSI supportive
+        buy_mask = (
+            (df["EMA_FAST"] > df["EMA_SLOW"]) &
+            (df["MACD_HIST"] > 0) &
+            (df["close"] > df["BB_MID"]) &
+            (df["RSI"] > 50)
+        )
 
-# ========== TRADE PLANNING ==========
-def make_trade_plan(signal, price, atr, balance=1000, risk_per_trade=0.01):
-    risk_amount = balance * risk_per_trade
-    if atr == 0:
-        atr = price * 0.01
-    position_size = risk_amount / atr
-    if signal == "BUY":
-        sl = price - 1.5 * atr
-        tp = price + 3 * atr
-    elif signal == "SELL":
-        sl = price + 1.5 * atr
-        tp = price - 3 * atr
-    else:
-        sl, tp = None, None
-    return {"size": position_size, "sl": sl, "tp": tp}
+        # SELL: bearish EMA stack, MACD momentum negative, price below BB mid, RSI weak
+        sell_mask = (
+            (df["EMA_FAST"] < df["EMA_SLOW"]) &
+            (df["MACD_HIST"] < 0) &
+            (df["close"] < df["BB_MID"]) &
+            (df["RSI"] < 50)
+        )
 
-# ========== PAIR SCANNER ==========
-def scan_pairs(exchange_mgr, base="USDT", limit=10):
-    if exchange_mgr.mock_mode:
-        return [f"MOCK/{base}"] * limit
-    markets = exchange_mgr.exchange.load_markets()
-    pairs = [m for m in markets if m.endswith("/" + base)]
-    ranked = []
-    for pair in pairs:
+        df.loc[buy_mask, "signal"] = "BUY"
+        df.loc[sell_mask, "signal"] = "SELL"
+
+        # Clean early NaNs (first N bars) -> HOLD
+        needed_cols = ["EMA_FAST", "EMA_SLOW", "RSI", "MACD_HIST", "BB_MID"]
+        early_nan = df[needed_cols].isna().any(axis=1)
+        df.loc[early_nan, "signal"] = "HOLD"
+
+        return df
+
+
+# =========================
+# Backtester (very simple count-based example)
+# =========================
+class Backtester:
+    def __init__(self, strategy: TradingStrategy):
+        self.strategy = strategy
+
+    def run(self, df: pd.DataFrame) -> dict:
+        if df is None or df.empty:
+            return {"total_trades": 0, "buy_signals": 0, "sell_signals": 0}
+
+        sigs = self.strategy.generate_signals(df)
+        buys = int((sigs["signal"] == "BUY").sum())
+        sells = int((sigs["signal"] == "SELL").sum())
+        total = buys + sells
+
+        # (Optional) super-light PnL proxy: price change after signal next bar
+        pnl = 0.0
+        closes = sigs["close"].values
+        signals = sigs["signal"].values
+        for i in range(len(sigs) - 1):
+            if signals[i] == "BUY":
+                pnl += closes[i + 1] - closes[i]
+            elif signals[i] == "SELL":
+                pnl += closes[i] - closes[i + 1]
+
+        return {"total_trades": total, "buy_signals": buys, "sell_signals": sells, "pnl_proxy": float(pnl)}
+
+
+# =========================
+# Telegram notifier
+# =========================
+class TelegramNotifier:
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+
+    def send_message(self, text: str) -> bool:
         try:
-            df = exchange_mgr.fetch_ohlcv(pair, "1h", limit=50)
-            df = pd.DataFrame(df, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            volatility = df["close"].std()
-            volume = df["volume"].mean()
-            ranked.append((pair, volatility * volume))
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            r = requests.post(url, json={"chat_id": self.chat_id, "text": text}, timeout=10)
+            return r.status_code == 200
         except Exception:
-            continue
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    return [p[0] for p in ranked[:limit]]
-
-# ========== BACKTESTING ==========
-def run_backtest(df):
-    df = analyze_market(df)
-    balance = 1000
-    for i in range(50, len(df)):
-        p_up = probability_model(df.iloc[:i], 0)
-        signal, atr = generate_signal(df.iloc[:i], p_up, 0)
-        if signal != "WAIT":
-            plan = make_trade_plan(signal, df["close"].iloc[i], atr, balance)
-            balance += (plan["tp"] - df["close"].iloc[i]) if signal == "BUY" else (df["close"].iloc[i] - plan["tp"])
-    return balance
-
-# ========== TELEGRAM ALERTS ==========
-def send_telegram_alert(token, chat_id, message, df=None):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, data={"chat_id": chat_id, "text": message})
-
-    # Optional chart snapshot
-    if df is not None:
-        fig = go.Figure(data=[go.Candlestick(
-            x=df["timestamp"],
-            open=df["open"], high=df["high"], low=df["low"], close=df["close"]
-        )])
-        fig.update_layout(title="Market Snapshot", xaxis_rangeslider_visible=False)
-        img_bytes = fig.to_image(format="png", engine="kaleido")
-        files = {"photo": BytesIO(img_bytes)}
-        url = f"https://api.telegram.org/bot{token}/sendPhoto"
-        requests.post(url, data={"chat_id": chat_id}, files=files)
+            return False
