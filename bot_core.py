@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+# ===== VERSION SAFETY CHECK =====
+import sys
+if sys.version_info < (3, 8):
+    raise RuntimeError("Python 3.8+ required (Current: {}.{})".format(sys.version_info.major, sys.version_info.minor))
+
+# ===== YOUR ORIGINAL IMPORTS =====
+# [KEEP ALL YOUR EXISTING IMPORTS BELOW THIS LINE]
+import os
+import time
+import functools
+import pandas as pd
+import numpy as np
+import ccxt
+import pandas_ta as ta
+import logging
 import os
 import time
 import functools
