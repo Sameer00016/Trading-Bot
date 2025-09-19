@@ -25,7 +25,6 @@ SAFE_TIMEOUT = 20000
 # Utils
 # ---------------------------
 def _secret_env(key: str, default: Optional[str] = None) -> Optional[str]:
-    # Priority: env (Streamlit can load .env into env in cloud too)
     return os.getenv(key, default)
 
 def _now_iso() -> str:
@@ -59,7 +58,6 @@ def backoff_retry(max_retries: int = 5, base_delay: float = 1.0, max_delay: floa
 
 
 def _tf_to_freq(tf: str) -> str:
-    # pandas freq mapping
     mapper = {
         "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
         "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H",
@@ -69,7 +67,7 @@ def _tf_to_freq(tf: str) -> str:
 
 
 # ---------------------------
-# Indicators (pure pandas/numpy)
+# Indicators
 # ---------------------------
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -141,14 +139,9 @@ def orderbook_imbalance(ob: Optional[Dict[str, Any]], depth: int = 20) -> float:
 # Exchange Manager
 # ---------------------------
 class ExchangeManager:
-    def __init__(
-        self,
-        exchange_name: str = "binance",
-        api_key: Optional[str] = None,
-        api_secret: Optional[str] = None,
-        password: Optional[str] = None,
-        mock_mode: Optional[bool] = None
-    ):
+    def __init__(self, exchange_name: str = "binance", api_key: Optional[str] = None,
+                 api_secret: Optional[str] = None, password: Optional[str] = None,
+                 mock_mode: Optional[bool] = None):
         name = (exchange_name or "mock").lower()
         self.name = name
         self.mock_mode = (mock_mode if mock_mode is not None else (name == "mock" or not _CCXT_OK))
@@ -164,7 +157,6 @@ class ExchangeManager:
                     "enableRateLimit": True,
                     "timeout": SAFE_TIMEOUT,
                 }
-                # remove None to avoid ccxt complaints
                 config = {k: v for k, v in config.items() if v is not None}
                 self.ex = klass(config)
                 if hasattr(self.ex, "load_markets"):
@@ -173,7 +165,6 @@ class ExchangeManager:
                 self.ex = None
                 self.mock_mode = True
 
-    # Symbols
     def symbols_usdt(self, max_items: int = 500) -> List[str]:
         majors_fx = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD", "NZD/USD", "USD/CAD"]
         if self.mock_mode or not self.ex:
@@ -225,69 +216,48 @@ class ExchangeManager:
 
 
 # ---------------------------
-## Analysis & Signal (patched to avoid duplicate indicator columns)
+# Analysis & Signal
 # ---------------------------
 def _prep_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # defensive copy and remove exact duplicate columns first
     df = df.copy()
-    df = df.loc[:, ~df.columns.duplicated()]
 
-    # normalize timestamp column presence
+    # ✅ Drop previous indicators to avoid duplicate column error
+    drop_cols = [
+        "EMA_FAST","EMA_SLOW","RSI","MACD","MACD_SIGNAL","MACD_HIST","ATR",
+        "BB_MID","BB_UP","BB_LO","BB_WIDTH","BB_PB",
+        "PRICE_SLOPE","PRICE_ACCEL","MACD_SLOPE","MACD_ACCEL"
+    ]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
     if "timestamp" not in df.columns:
         df.reset_index(inplace=True)
         df.rename(columns={"index": "timestamp"}, inplace=True)
 
-    # ensure time ordering
     if not df.index.is_monotonic_increasing:
         df.sort_values("timestamp", inplace=True)
 
-    # --- DROP any previously added indicator columns to prevent duplicates ---
-    drop_if_present = [
-        "EMA_FAST", "EMA_SLOW", "RSI", "MACD", "MACD_SIGNAL", "MACD_HIST",
-        "ATR", "BB_MID", "BB_UP", "BB_LO", "BB_WIDTH", "BB_PB",
-        "PRICE_SLOPE", "PRICE_ACCEL", "MACD_SLOPE", "MACD_ACCEL",
-        "prob_up", "signal"
-    ]
-    for c in drop_if_present:
-        if c in df.columns:
-            df.drop(columns=[c], inplace=True)
-
-    # Indicators (compute into locals first)
-    ema_fast = ema(df["close"], 20)
-    ema_slow = ema(df["close"], 50)
-    rsi_s = rsi(df["close"], 14)
+    # Recalculate indicators
+    df["EMA_FAST"] = ema(df["close"], 20)
+    df["EMA_SLOW"] = ema(df["close"], 50)
+    df["RSI"] = rsi(df["close"], 14)
     macd_line, macd_sig, macd_hist = macd(df["close"])
-    atr_s = atr(df, 14)
-    bb_mid, bb_up, bb_lo, bb_w, bb_pb = bollinger(df["close"], 20, 2.0)
-    price_slope = slope(df["close"], 5)
-    price_accel = acceleration(df["close"], 5)
-    macd_slope = slope(macd_hist, 5)
-    macd_accel = acceleration(macd_hist, 5)
-
-    # Assign computed indicators (single assignment avoids duplicate column creation)
-    df["EMA_FAST"] = ema_fast
-    df["EMA_SLOW"] = ema_slow
-    df["RSI"] = rsi_s
     df["MACD"] = macd_line
     df["MACD_SIGNAL"] = macd_sig
     df["MACD_HIST"] = macd_hist
-    df["ATR"] = atr_s
-    df["BB_MID"] = bb_mid
-    df["BB_UP"] = bb_up
-    df["BB_LO"] = bb_lo
-    df["BB_WIDTH"] = bb_w
-    df["BB_PB"] = bb_pb
-    df["PRICE_SLOPE"] = price_slope
-    df["PRICE_ACCEL"] = price_accel
-    df["MACD_SLOPE"] = macd_slope
-    df["MACD_ACCEL"] = macd_accel
+    df["ATR"] = atr(df, 14)
+    bb_mid, bb_up, bb_lo, bb_w, bb_pb = bollinger(df["close"], 20, 2.0)
+    df["BB_MID"], df["BB_UP"], df["BB_LO"], df["BB_WIDTH"], df["BB_PB"] = bb_mid, bb_up, bb_lo, bb_w, bb_pb
+    df["PRICE_SLOPE"] = slope(df["close"], 5)
+    df["PRICE_ACCEL"] = acceleration(df["close"], 5)
+    df["MACD_SLOPE"] = slope(df["MACD_HIST"], 5)
+    df["MACD_ACCEL"] = acceleration(df["MACD_HIST"], 5)
 
-    # Clean: remove any inf/nan and duplicate columns, reindex
-    df = df.loc[:, ~df.columns.duplicated()].copy()
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
     df.reset_index(drop=True, inplace=True)
+
     return df
+
 
 def _logistic(x: float) -> float:
     x = float(np.clip(x, -12.0, 12.0))
@@ -320,7 +290,6 @@ def analyze_and_signal(df: pd.DataFrame, orderbook: Optional[Dict[str, Any]] = N
     p_up = _prob_from_row(df.iloc[-1], ob_imb)
     conf = int(np.clip(abs(p_up - 0.5) * 200, 0, 100))
 
-    # TA gates (conservative blend)
     r = df.iloc[-1]
     long_ok = (r["EMA_FAST"] > r["EMA_SLOW"]) and (r["RSI"] < 60) and (r["MACD_HIST"] > 0) and (p_up > 0.55)
     short_ok = (r["EMA_FAST"] < r["EMA_SLOW"]) and (r["RSI"] > 40) and (r["MACD_HIST"] < 0) and (p_up < 0.45)
@@ -344,19 +313,18 @@ def analyze_and_signal(df: pd.DataFrame, orderbook: Optional[Dict[str, Any]] = N
         "prob_up": float(p_up),
         "orderbook_imbalance": float(ob_imb),
         "confidence": int(conf),
-        "df": df,  # include processed DF for charts/tables
+        "df": df,
     }
 
 
 # ---------------------------
-# Backtest (very light)
+# Backtest
 # ---------------------------
 def backtest(df: pd.DataFrame) -> Dict[str, Any]:
     df = _prep_indicators(df)
     if df.empty or len(df) < 3:
         return {"total_trades": 0, "buy": 0, "sell": 0, "pnl_proxy": 0.0}
 
-    # fixed ob_imb assumption for quick backtest
     ob_imb = 0.5
     probs = []
     for _, row in df.iterrows():
