@@ -22,6 +22,7 @@ st.markdown("<h2 style='text-align:center'>🤖 AI Trading Bot — Live Signals<
 # Helpers
 # ---------------------------
 def _secret(key, default=None):
+    # Streamlit secrets first, then env
     try:
         if key in st.secrets:
             return st.secrets[key]
@@ -29,8 +30,9 @@ def _secret(key, default=None):
         pass
     return os.getenv(key, default)
 
+
 # ---------------------------
-# Authentication
+# Authentication (simple)
 # ---------------------------
 LOGIN_CODE = _secret("LOGIN_CODE", "Sam0316")
 pwd = st.text_input("Enter access code", type="password")
@@ -39,7 +41,7 @@ if pwd != LOGIN_CODE:
     st.stop()
 
 # ---------------------------
-# Sidebar
+# Sidebar — Connection & Settings
 # ---------------------------
 st.sidebar.header("Connection")
 exch_name = st.sidebar.selectbox("Exchange", SUPPORTED_EXCHANGES, index=0)
@@ -52,10 +54,14 @@ api_password = st.sidebar.text_input("API Password (if required)", type="passwor
 mock_mode = st.sidebar.checkbox("Mock mode (no live API)", value=(exch_name == "mock" or not (api_key and api_secret)))
 
 st.sidebar.header("Parameters")
-timeframe = st.sidebar.selectbox("Timeframe", ["1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d"], index=6)
+timeframe = st.sidebar.selectbox(
+    "Timeframe",
+    ["1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d"],
+    index=6,
+)
 limit = st.sidebar.number_input("Candles", min_value=100, max_value=2000, value=500, step=50)
 
-# Auto-refresh
+# Auto-refresh (real-time monitoring)
 st.sidebar.header("Real-time")
 auto_refresh = st.sidebar.checkbox("Auto-refresh", value=False)
 refresh_sec = st.sidebar.slider("Refresh every (sec)", 5, 120, 20)
@@ -66,7 +72,7 @@ TELE_TOKEN = st.sidebar.text_input("Bot Token", type="password", value=_secret("
 TELE_CHAT  = st.sidebar.text_input("Chat ID", value=_secret("TELEGRAM_CHAT_ID", ""))
 
 # ---------------------------
-# Exchange init
+# Exchange init & symbols
 # ---------------------------
 ex = ExchangeManager(exch_name, api_key=api_key or None, api_secret=api_secret or None, password=api_password or None, mock_mode=mock_mode)
 
@@ -83,9 +89,7 @@ with st.expander("🔎 Symbols"):
     if custom.strip():
         pair = custom.strip().upper()
 
-# ---------------------------
-# Buttons
-# ---------------------------
+# Action buttons
 cols = st.columns(4)
 run_btn = cols[0].button("Get Signal Now")
 bt_btn  = cols[1].button("Quick Backtest")
@@ -98,7 +102,7 @@ if clear_btn:
     st.success("Cache cleared.")
 
 # ---------------------------
-# Main Logic
+# Main logic (one-shot or loop)
 # ---------------------------
 def run_once():
     try:
@@ -107,21 +111,27 @@ def run_once():
             ob = ex.get_orderbook(pair, limit=50)
 
             res = analyze_and_signal(df, orderbook=ob)
-            sig_df = res["df"].copy()
+            sig_df = res["df"]
+            side = res["side"]
+            conf = res["confidence"]
 
-            # ✅ Ensure no duplicate columns
-            sig_df = sig_df.loc[:, ~sig_df.columns.duplicated()]
-            res["df"] = sig_df  # update result
+            # Signal color logic
+            if conf > 70:
+                color = "🟢"
+            elif conf >= 40:
+                color = "🟡"
+            else:
+                color = "🔴"
 
-            # Summary metrics
+            # top summary
             top_cols = st.columns(5)
-            top_cols[0].metric("Signal", res["side"])
+            top_cols[0].metric("Signal", f"{color} {side}")
             top_cols[1].metric("Price", f"{res['price']:.6f}")
             top_cols[2].metric("Prob ↑", f"{res['prob_up']:.2%}")
             top_cols[3].metric("OB Imbalance", f"{res['orderbook_imbalance']:.2%}")
-            top_cols[4].metric("Confidence", f"{res['confidence']}")
+            top_cols[4].metric("Confidence", f"{conf}")
 
-            # Chart
+            # chart
             try:
                 import plotly.graph_objects as go
                 fig = go.Figure(data=[go.Candlestick(
@@ -134,9 +144,9 @@ def run_once():
             except Exception:
                 st.info("Plotly not available; skipping chart.")
 
-            # Table
+            # table
             show_rows = st.slider("Rows to display", 10, 200, 40)
-            display_cols = [c for c in ["timestamp", "close", "EMA_FAST", "EMA_SLOW", "RSI", "MACD_HIST", "BB_PB", "PRICE_SLOPE", "prob_up"] if c in sig_df.columns]
+            display_cols = ["timestamp", "close", "EMA_FAST", "EMA_SLOW", "RSI", "MACD_HIST", "BB_PB", "PRICE_SLOPE", "prob_up" if "prob_up" in sig_df.columns else "RSI"]
             st.dataframe(sig_df.tail(show_rows)[display_cols])
 
             return res
@@ -144,7 +154,7 @@ def run_once():
         st.error(f"Failed to get signals: {e}")
         return None
 
-# Actions
+# one-shot actions
 last_result = None
 if run_btn:
     last_result = run_once()
@@ -173,6 +183,7 @@ if tg_btn:
     except Exception as e:
         st.error(f"Telegram send failed: {e}")
 
+# auto-refresh loop (non-blocking pattern)
 if auto_refresh:
     st.caption(f"🔁 Auto-refresh enabled — every {refresh_sec}s")
     _ = run_once()
